@@ -1,0 +1,574 @@
+---
+title: "Forest Ownership Dynamics"
+subtitle: "Estimated Changeds in Land Area by Condition Status and Forest Ownership"
+author:
+  - Brett J. Butler^[USDA Forest Service, brett.butler2@usda.gov]
+output: html_document
+---
+
+This report documents the methods used to retrieve, summarize, and analyze data for the "Forest Ownership Dynamics" article (*DOI to be added*).
+
+# General set up
+```{r General Set up, warning = F, message = F}
+library(tidyverse)
+library(RODBC)
+library(usmap)
+source("../R/get_evalgrps.R")
+source("../R/get_counties.R")
+source("../R/get_estimates.R")
+source("../R/get_base_estimates.R")
+source("../R/get_plot.R")
+ref.cnty <- read_csv("../DATA/_REF_COUNTY.csv", col_type = "fffcff")
+ref.state <- read_csv("../DATA/_REF_STATE.csv", col_type = "fffcff")
+ref.foresttype <- read_csv("../DATA/_REF_FOREST_TYPE.csv", col_type = "fcfc")
+# cbp <- c("#009E73", "#F0E442", "#56B4E9", "#E69F00", "#0072B2", "#D55E00", "#CC79A7", "#999999", "#000000") 
+```
+
+## Get EVAL_GRPs
+An Evaluation Group (EVAL_GRP) is a unique value in the FIA database that identifies the FIA NFI sample used to generate estimates (Burrill et al. 2024). The specific EVAL_GRPs used for the forest area estimates generated from this script are listed in the Appendix of this report. 
+
+```{r EVALIDs}
+evalgrps <- list(evalgrps.2023 = read_csv("../DATA/EVALGRPS_2023.csv", col_types = "cfcii"),
+                 evalgrps.2018 = read_csv("../DATA/EVALGRPS_2018.csv", col_types = "cfcii"),
+                 evalgrps.2013 = read_csv("../DATA/EVALGRPS_2013.csv", col_types = "cfcii"))
+```
+
+Alaska, Oklahoma, and Texas are divided by FIA NFI into sub-state regions, defined by groups of counties, for sampling and estimation. In addition, an issue with the 2005 sample in interior Alaska where a large acreage of wildernss area was not inventoried, had to be addressed (i.e., excluding an estimaion unit set up to explicitly deal with this issue).
+
+```{r EVAL_GRP Add Counties for AK OK TX}
+evalgrps <- lapply(evalgrps, function(x) { x %>%
+    mutate(COUNTIES = case_when(STATECD_NWOS == "2.1" ~ get_counties("2.1"),
+                                STATECD_NWOS == "40.1" ~ get_counties("40.1"),
+                                STATECD_NWOS == "40.2" ~ get_counties("40.2"),
+                                STATECD_NWOS == "48.1" ~ get_counties("48.1"),
+                                STATECD_NWOS == "48.2" ~ get_counties("48.2"),
+                                .default = "IS NOT NULL"))})
+evalgrps <- lapply(evalgrps, function(x) { x %>%
+    mutate(ESTN_UNIT = case_when(STATECD_NWOS == "2.1" ~ "<> 4",
+                                 .default = "IS NOT NULL"))})
+```
+
+## Summaries of EVAL_GRPs
+```{r EVAL_GRP Summaries}
+evalgrp.summary <- bind_rows(evalgrps$evalgrps.2023 %>% mutate(YEAR = 2023),
+                             evalgrps$evalgrps.2018 %>% mutate(YEAR = 2018),
+                             evalgrps$evalgrps.2013 %>% mutate(YEAR = 2013)) %>%
+  select(STATECD = STATECD_NWOS, YEAR, START_INVYR, END_INVYR) %>%
+  pivot_wider(names_from = YEAR, values_from = c(START_INVYR, END_INVYR))
+evalgrp.summary
+summary(evalgrp.summary)
+```
+
+# Forest Trends
+
+## Get Base Estimates
+```{r Get Base Estimates}
+# base.estimates.2023 <- bind_rows(mapply(get_base_estimates,
+#                          evalgrp = (evalgrps$evalgrps.2023 %>% pull(EVAL_GRP)),
+#                          statecd.nwos = (evalgrps$evalgrps.2023 %>% pull(STATECD_NWOS)),
+#                          cnty = (evalgrps$evalgrps.2023 %>% pull(COUNTIES)),
+#                          SIMPLIFY = F)) %>% mutate(YEAR = 2023)
+# base.estimates.2013 <- bind_rows(mapply(get_base_estimates,
+#                          evalgrp = (evalgrps$evalgrps.2013 %>% pull(EVAL_GRP)),
+#                          statecd.nwos = (evalgrps$evalgrps.2013 %>% pull(STATECD_NWOS)),
+#                          cnty = (evalgrps$evalgrps.2013 %>% pull(COUNTIES)),
+#                          eu = (evalgrps$evalgrps.2013 %>% pull(ESTN_UNIT)),
+#                          SIMPLIFY = F)) %>% mutate(YEAR = 2013)
+# base.estimates <- bind_rows(base.estimates.2023,
+#                             base.estimates.2013)
+# write_csv(base.estimates, "../DATA/BASE_ESTIMATES.csv")
+base.estimates <- read_csv("../DATA/BASE_ESTIMATES.csv", col_types = "_fd__d___fi") %>%
+  separate_wider_delim(STATECD_NWOS, ".", too_many = "drop", names = "STATECD", cols_remove = F) %>%
+  mutate(STATECD = as.factor(STATECD)) %>%
+  rename(ACRES = ESTIMATE, ACRES_VARIANCE = VAR_OF_ESTIMATE) %>%
+  mutate(COND_STATUS_CD = case_match(COND_STATUS_CD,
+                                     "1" ~ "FOREST",
+                                     "2" ~ "NONFOREST",
+                                     c("3", "4") ~ "WATER",
+                                     .default = COND_STATUS_CD)) %>%
+  group_by(STATECD, STATECD_NWOS, YEAR, COND_STATUS_CD) %>%
+  summarize(across(c(ACRES, ACRES_VARIANCE), sum), .groups = "drop") %>%
+  select(STATECD, STATECD_NWOS, YEAR, COND_STATUS_CD, ACRES, ACRES_VARIANCE) %>%
+  arrange(STATECD_NWOS, COND_STATUS_CD, YEAR)
+```
+
+```{r Forest Trends}
+base.estimates %>%
+  filter(COND_STATUS_CD == "FOREST") %>%
+  group_by(YEAR) %>%
+  summarize(across(c(ACRES, ACRES_VARIANCE), sum), .groups = "drop") %>%
+  mutate(AC = ACRES / 1e6, 
+         AC_SE = sqrt(ACRES_VARIANCE) / 1e6) %>%
+  select(YEAR, AC, AC_SE) %>%
+  pivot_wider(names_from = YEAR, values_from = c(AC, AC_SE)) %>%
+  mutate(DIFF = AC_2023 - AC_2013,
+         DIFF_PERC = (DIFF / AC_2013) * 100,
+         DIFF_ANNUAL = DIFF / 10,
+         DIFF_ANNUAL_PERC = (DIFF_ANNUAL / AC_2013) * 100) %>%
+  mutate(across(AC_2013:AC_SE_2023, ~ round(.x, 1)),
+         across(DIFF:DIFF_ANNUAL_PERC, ~ round(.x, 2)))
+```
+
+```{r State Totals}
+forestarea.state.total <- base.estimates %>%
+  filter(COND_STATUS_CD == "FOREST") %>%
+  group_by(YEAR, STATECD) %>%
+  summarize(across(c(ACRES, ACRES_VARIANCE), sum), .groups = "drop") %>%
+  mutate(AC = ACRES / 1e6, AC_SE = sqrt(ACRES_VARIANCE) / 1e6) %>%
+  select(YEAR, STATECD, AC, AC_SE) %>%
+  pivot_wider(names_from = YEAR, values_from = c(AC, AC_SE)) %>%
+  mutate(DIFF = AC_2023 - AC_2013,
+         DIFF_PERC = (DIFF / AC_2013) * 100,
+         DIFF_ANN = DIFF / 10,
+         DIFF_ANN_PERC = (DIFF_ANN / AC_2013) * 100,
+         DIFF_ANN_PERC_CAT = cut(DIFF_ANN_PERC, 
+                                 breaks = c(-Inf, -0.25, -0.05, 0.05, 0.25, Inf),
+                                 labels = c("<-0.25", "-0.25 to -0.06", "0.05 to -0.05",
+                                            "0.06 to 0.25", ">0.25")),
+         DIFF_ANN_PERC_CAT = factor(DIFF_ANN_PERC_CAT, 
+                                    levels = c(">0.25", "0.06 to 0.25", "0.05 to -0.05",
+                                               "-0.25 to -0.06","<-0.25")),
+         fips = STATECD) 
+forestarea.state.total %>% count(DIFF_ANN_PERC_CAT)
+plot_usmap("state", include = ref.state %>% distinct(STATE_FIA_ABB) %>% pull(),
+           data = forestarea.state.total, values = "DIFF_ANN_PERC_CAT") +
+  scale_fill_manual(values = rev(c("#a6611a", "#dfc27d", "#f5f5f5", "#80cdc1", "#018571")), 
+                    name = "Percentage\nAnnual\nChange") +
+  theme(legend.position = "right")
+# ggsave("../FIGURES/ANNUAL_CHANGE_MAP.pdf", width = 6, height = 3)
+# ggsave("../FIGURES/ANNUAL_CHANGE_MAP.png", width = 6, height = 3)
+```
+
+# Forest Transitions
+
+```{r get_plot}
+# plots <- bind_rows(mapply(get_plot,
+#                           evalgrp = (evalgrps$evalgrps.2023 %>% pull(EVAL_GRP)),
+#                           statecd.nwos = (evalgrps$evalgrps.2023 %>% pull(STATECD_NWOS)),
+#                           cnty = (evalgrps$evalgrps.2023 %>% pull(COUNTIES)),
+#                           SIMPLIFY = F))
+# write_csv(plots, "../DATA/PLOTS.csv")
+plots <- read_csv("../DATA/PLOTS.csv", col_types = "ciiiidffffddf") %>%
+  separate_wider_delim(STATECD_NWOS, ".", too_many = "drop", names = "STATECD", cols_remove = F) %>%
+  mutate(STATECD = as.factor(STATECD),
+         COND_STATUS_CD = case_match(COND_STATUS_CD,
+                                     "1" ~ "FOREST",
+                                     "2" ~ "NONFOREST",
+                                     c("3", "4") ~ "WATER",
+                                     .default = COND_STATUS_CD),
+         PREV_COND_STATUS_CD = case_match(PREV_COND_STATUS_CD,
+                                          "1" ~ "FOREST",
+                                          "2" ~ "NONFOREST",
+                                          c("3", "4") ~ "WATER",
+                                          "5" ~ "NONSAMPLED",
+                                          .default = PREV_COND_STATUS_CD),
+         across(c(PRESNFCD, PREV_PRESNFCD),
+                ~ case_match(.x,
+                             c("10", "11", "12", "13") ~ "AGRICULTURE",
+                             c("20") ~ "RANGELAND",
+                             c("30", "31", "32") ~ "DEVELOPED",
+                             c("16", "17", "40", "41", "42", "43", "45") ~ "OTHER",
+                             .default = .x)),
+         LU = if_else(COND_STATUS_CD == "NONFOREST", PRESNFCD, COND_STATUS_CD),
+         PREV_LU = if_else(PREV_COND_STATUS_CD == "NONFOREST", PREV_PRESNFCD, PREV_COND_STATUS_CD))
+```
+## Average Remeasurement by EVAL_GRP
+
+```{r Remeasurement Periods}
+remper <- plots %>%
+  group_by(STATECD_NWOS) %>%
+  summarize(REMPER = mean(REMPER, na.rm = T))
+```
+
+```{r get_estimates}
+# estimates <- bind_rows(mapply(get_estimates,
+#                               evalgrp = (evalgrps$evalgrps.2023 %>% pull(EVAL_GRP)),
+#                               statecd.nwos = (evalgrps$evalgrps.2023 %>% pull(STATECD_NWOS)),
+#                               cnty = (evalgrps$evalgrps.2023 %>% pull(COUNTIES)),
+#                               SIMPLIFY = F))
+# write_csv(estimates, "../DATA/ESTIMATES.csv")
+estimates <- read_csv("../DATA/ESTIMATES.csv", col_types = "_ffffffffffffffd__d___f") %>%
+  separate_wider_delim(STATECD_NWOS, ".", too_many = "drop", names = "STATECD", cols_remove = F) %>%
+  rename(ACRES = ESTIMATE, ACRES_VARIANCE = VAR_OF_ESTIMATE) %>%
+  mutate(COND_STATUS_CD = case_match(COND_STATUS_CD,
+                                     "1" ~ "FOREST",
+                                     "2" ~ "NONFOREST",
+                                     c("3", "4") ~ "WATER",
+                                     .default = COND_STATUS_CD),
+         PREV_COND_STATUS_CD = case_match(PREV_COND_STATUS_CD,
+                                          "1" ~ "FOREST",
+                                          "2" ~ "NONFOREST",
+                                          c("3", "4") ~ "WATER",
+                                          "5" ~ "NONSAMPLED",
+                                          .default = PREV_COND_STATUS_CD),
+         across(c(PRESNFCD, PREV_PRESNFCD),
+                ~ case_match(.x,
+                             c("10", "11", "12", "13") ~ "AGRICULTURE",
+                             c("20") ~ "RANGELAND",
+                             c("30", "31", "32") ~ "DEVELOPED",
+                             c("16", "17", "40", "41", "42", "43", "45") ~ "OTHER",
+                             .default = .x)),
+         across(c(OWNCD, PREV_OWNCD),
+                ~ case_match(.x,
+                             c("11", "12", "13", "21",
+                               "22", "23", "24", "25") ~ "FEDERAL",
+                             c("31") ~ "STATE",
+                             c("32", "33") ~ "LOCAL" ,
+                             c("41", "42", "43") ~ "CORPORATE",
+                             c("44") ~ "TRIBAL",
+                             c("45") ~ "FAMILY"))) %>%
+  mutate(LU = if_else(COND_STATUS_CD == "FOREST", "FOREST", PRESNFCD),
+         PREV_LU = if_else(PREV_COND_STATUS_CD == "FOREST", "FOREST", PREV_PRESNFCD)) %>%
+  group_by(STATECD, STATECD_NWOS, COND_STATUS_CD, PREV_COND_STATUS_CD, 
+           PRESNFCD, PREV_PRESNFCD, LU, PREV_LU,
+           OWNCD, PREV_OWNCD, 
+           RESERVCD, PREV_RESERVCD, FORTYPCD, PREV_FORTYPCD,
+           STDORGCD, PREV_STDORGCD, SITECLCD, PREV_SITECLCD) %>%
+  summarize(across(c(ACRES, ACRES_VARIANCE), sum), .groups = "drop") %>%
+  left_join(remper %>%
+              group_by(STATECD_NWOS) %>%
+              summarize(REMPER = mean(REMPER, na.rm = T)), 
+            by = join_by(STATECD_NWOS)) %>%
+  mutate(STATECD_NWOS = factor(STATECD_NWOS))
+```
+
+## Check Total Forest Acreage 
+```{r Forest Acreage Check}
+left_join(estimates %>%
+            filter(COND_STATUS_CD == "FOREST") %>%
+            group_by(STATECD_NWOS) %>%
+            summarize(ACRES = sum(ACRES)),
+          base.estimates %>%
+            filter(YEAR == 2023 & COND_STATUS_CD == "FOREST") %>%
+            group_by(STATECD_NWOS) %>%
+            summarize(ACRES_BASE = sum(ACRES))) %>%
+  mutate(DIFF = (ACRES - ACRES_BASE) / 1e6)
+```
+
+
+## Adjust for Missingness
+For the land use transition matrix, missing data related to plots that were not remeasured, not sampled at $t_1$, and missing nonforest type needed to be adjusted for. The remeaurement issue, and related missing nonforest type issue, are primarily an issue in the Intermountain West states and West Texas.
+
+```{r Assess Missingness}
+estimates %>% count(COND_STATUS_CD) 
+estimates %>% count(PREV_COND_STATUS_CD)
+
+estimates %>% filter(COND_STATUS_CD == "NONFOREST") %>% count(PRESNFCD)
+estimates %>% filter(PREV_COND_STATUS_CD == "NONFOREST") %>% count(PREV_PRESNFCD)
+
+estimates %>% filter(COND_STATUS_CD == "NONFOREST") %>% count(LU)
+estimates %>% filter(PREV_COND_STATUS_CD == "NONFOREST") %>% count(PREV_LU)
+```
+
+### Adjust for Not Remeasured
+```{r T_1 NONSAMPLED ADJUST}
+nr.adj <- left_join(estimates %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_TOTAL = sum(ACRES), .groups = "drop"),
+                    estimates %>%
+                      filter(!is.na(PREV_COND_STATUS_CD)) %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_REMEASURED = sum(ACRES), .groups = "drop"),
+                    by = join_by(STATECD_NWOS)) %>%
+  mutate(NR_ADJ = ACRES_TOTAL / ACRES_REMEASURED) %>%
+  select(STATECD_NWOS, NR_ADJ)
+estimates <- estimates %>%
+  filter(!is.na(PREV_COND_STATUS_CD)) %>%
+  left_join(nr.adj, 
+            by = join_by(STATECD_NWOS)) %>%
+  mutate(ACRES = if_else(is.na(NR_ADJ), ACRES, ACRES * NR_ADJ)) %>%
+  select(-NR_ADJ)
+```
+
+### Adjust for T_1 NONSAMPLED
+```{r T_1 NONSAMPLED ADJUST}
+ns.adj <- left_join(estimates %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_TOTAL = sum(ACRES), .groups = "drop"),
+                    estimates %>%
+                      filter(PREV_COND_STATUS_CD != "NONSAMPLED") %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_SAMPLED = sum(ACRES), .groups = "drop"),
+                    by = join_by(STATECD_NWOS)) %>%
+  mutate(NS_ADJ = ACRES_TOTAL / ACRES_SAMPLED) %>%
+  select(STATECD_NWOS, NS_ADJ)
+estimates <- estimates %>%
+  filter(!(PREV_COND_STATUS_CD == "NONSAMPLED")) %>%
+  left_join(ns.adj, 
+            by = join_by(STATECD_NWOS)) %>%
+  mutate(ACRES = if_else(is.na(NS_ADJ), ACRES, ACRES * NS_ADJ)) %>%
+  select(-NS_ADJ)
+```
+
+### Adjust for PRESNFCD and PREV_PRESNFCD Missingness
+```{r}
+nf.adj <- left_join(estimates %>%
+                      filter(COND_STATUS_CD == "NONFOREST") %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_NONFOREST = sum(ACRES), .groups = "drop"),
+                    estimates %>%
+                      filter(COND_STATUS_CD == "NONFOREST" & !is.na(PRESNFCD)) %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_NONFOREST_NOT_MISSING = sum(ACRES), .groups = "drop"),
+                    by = join_by(STATECD_NWOS)) %>%
+  mutate(COND_STATUS_CD = "NONFOREST", 
+         NF_ADJ = ACRES_NONFOREST / ACRES_NONFOREST_NOT_MISSING) %>%
+  select(STATECD_NWOS, COND_STATUS_CD, NF_ADJ)
+estimates <- estimates %>%
+  filter(!(COND_STATUS_CD == "NONFOREST" & is.na(PRESNFCD))) %>%
+  left_join(nf.adj, 
+            by = join_by(STATECD_NWOS, COND_STATUS_CD)) %>%
+  mutate(ACRES = if_else(is.na(NF_ADJ), ACRES, ACRES * NF_ADJ)) %>%
+  select(-NF_ADJ)
+
+prev.nf.adj <- left_join(estimates %>%
+                           filter(PREV_COND_STATUS_CD == "NONFOREST") %>%
+                           group_by(STATECD_NWOS) %>%
+                           summarize(ACRES_PREV_NONFOREST = sum(ACRES), .groups = "drop"),
+                         estimates %>%
+                           filter(PREV_COND_STATUS_CD == "NONFOREST" & !is.na(PREV_PRESNFCD)) %>%
+                           group_by(STATECD_NWOS) %>%
+                           summarize(ACRES_PREV_NONFOREST_NOT_MISSING = sum(ACRES), .groups = "drop"),
+                         by = join_by(STATECD_NWOS)) %>%
+  mutate(PREV_COND_STATUS_CD = "NONFOREST", 
+         PREV_NF_ADJ = ACRES_PREV_NONFOREST / ACRES_PREV_NONFOREST_NOT_MISSING) %>%
+  select(STATECD_NWOS, PREV_COND_STATUS_CD, PREV_NF_ADJ)
+estimates <- estimates %>%
+  filter(!(PREV_COND_STATUS_CD == "NONFOREST" & is.na(PREV_PRESNFCD))) %>%
+  left_join(prev.nf.adj, 
+            by = join_by(STATECD_NWOS, PREV_COND_STATUS_CD)) %>%
+  mutate(ACRES = if_else(is.na(PREV_NF_ADJ), ACRES, ACRES * PREV_NF_ADJ)) %>%
+  select(-PREV_NF_ADJ)
+```
+
+```{r Reassess Missingness Re-check}
+estimates %>% filter(COND_STATUS_CD == "NONFOREST") %>% count(LU)
+estimates %>% filter(PREV_COND_STATUS_CD == "NONFOREST") %>% count(PREV_LU)
+
+estimates %>% count(COND_STATUS_CD) 
+estimates %>% count(PREV_COND_STATUS_CD)
+
+estimates %>% filter(COND_STATUS_CD == "NONFOREST") %>% count(PRESNFCD)
+estimates %>% filter(PREV_COND_STATUS_CD == "NONFOREST") %>% count(PREV_PRESNFCD)
+
+estimates %>% filter(COND_STATUS_CD == "NONFOREST") %>% count(LU) 
+estimates %>% filter(PREV_COND_STATUS_CD == "NONFOREST") %>% count(PREV_LU)
+```
+
+## Re-check Total Forest Acreage 
+```{r Forest Acreage Re-check}
+left_join(estimates %>%
+            filter(COND_STATUS_CD == "FOREST") %>%
+            group_by(STATECD_NWOS) %>%
+            summarize(ACRES = sum(ACRES)),
+          base.estimates %>%
+            filter(YEAR == 2023 & COND_STATUS_CD == "FOREST") %>%
+            group_by(STATECD_NWOS) %>%
+            summarize(ACRES_BASE = sum(ACRES))) %>%
+  mutate(DIFF = (ACRES - ACRES_BASE) / 1e6)
+```
+
+## Land Use Transition Matrix
+```{r Land Use Transition Matrix}
+lu.tran <- estimates %>%
+  mutate(ACRES = ACRES / REMPER) %>%
+  group_by(LU, PREV_LU) %>%
+  summarize(ACRES = sum(ACRES) / 1e6, .groups = "drop") %>%
+  mutate(ACRES = if_else(LU == PREV_LU, as.numeric(NA), ACRES)) %>%
+  filter(!is.na(ACRES)) %>%
+  mutate(across(c(LU, PREV_LU), ~ factor(.x, levels = c("FOREST", "AGRICULTURE",
+                                                        "RANGELAND", "DEVELOPED", 
+                                                        "OTHER")))) %>%
+  pivot_wider(names_from = LU, values_from = ACRES) %>%
+  arrange(PREV_LU) %>%
+  select(PREV_LU, FOREST, AGRICULTURE, RANGELAND, DEVELOPED, OTHER)
+lu.tran <- left_join(lu.tran,
+                     lu.tran %>%
+                       mutate(across(c(FOREST, AGRICULTURE, RANGELAND, DEVELOPED, OTHER), 
+                                     ~ if_else(is.na(.x), 0, .x))) %>%
+                       mutate(TOTAL = FOREST + AGRICULTURE + RANGELAND + DEVELOPED + OTHER) %>%
+                       select(PREV_LU, TOTAL), by = join_by(PREV_LU)) %>%
+  bind_rows(lu.tran %>%
+              summarize(across(c(FOREST, AGRICULTURE, RANGELAND, DEVELOPED, OTHER), 
+                               ~ sum(.x, na.rm = T))) %>%
+              mutate(PREV_LU = "TOTAL")) %>%
+  mutate(across(FOREST:TOTAL, ~ round(.x, 1)))
+lu.tran
+write_csv(lu.tran, "../DATA/LANDUSE_TRANSITION_MATRIX.csv")
+```
+
+## Gain/Loss Map
+```{r Gain Loss Maps}
+plot.loss <- plot %>%
+  filter(PREV_COND_STATUS_CD == "FOREST" & COND_STATUS_CD != "FOREST") 
+plot.loss <- usmap_transform(plot.loss, input_names = c("LON", "LAT")) %>%
+  mutate(PRESNFCD = factor(PRESNFCD, 
+                           levels = c("AGRICULTURE", "RANGELAND", "DEVELOPED", "OTHER"),
+                           labels = c("Agriculture", "Rangeland", "Developed", "Other")))
+plot_usmap("state") + 
+  geom_sf(data = plot.loss, aes(color = PRESNFCD)) + 
+  ggtitle("A. Forest loss") +
+  scale_color_manual(values = c("#CC79A7", "#56B4E9", "#E69F00", "#999999"), 
+                     name = "Lost to:") +
+  theme(legend.position = "right")
+ggsave("../FIGURES/FOREST_LOSS_MAP.pdf", width = 6, height = 3)
+ggsave("../FIGURES/FOREST_LOSS_MAP.png", width = 6, height = 3)
+
+plot.gain <- plot %>%
+  filter(PREV_COND_STATUS_CD != "FOREST" & COND_STATUS_CD == "FOREST" & !is.na(PREV_PRESNFCD)) 
+plot.gain <- usmap_transform(plot.gain, input_names = c("LON", "LAT")) %>%
+  mutate(PREV_PRESNFCD = factor(PREV_PRESNFCD, 
+                                levels = c("AGRICULTURE", "RANGELAND", "DEVELOPED", "OTHER"),
+                                labels = c("Agriculture", "Rangeland", "Developed", "Other")))
+plot_usmap("state") + 
+  geom_sf(data = plot.gain, aes(color = PREV_PRESNFCD)) + 
+  ggtitle("B. Forest gain") +
+  scale_color_manual(values = c("#CC79A7", "#56B4E9", "#E69F00", "#999999"), 
+                     name = "Gain from:") +
+  theme(legend.position = "right")
+ggsave("../FIGURES/FOREST_GAIN_MAP.pdf", width = 6, height = 3)
+ggsave("../FIGURES/FOREST_GAIN_MAP.png", width = 6, height = 3)
+```
+
+## Forest Lost by Forest Type
+
+*ADJUST FOR MISSINGNESS*
+
+```{r PREV_FOREST_TYPE}
+estimates %>% filter(PREV_COND_STATUS_CD == "FOREST") %>% count(PREV_FORTYPCD)
+
+ft.adj <- left_join(estimates %>%
+                      filter(PREV_COND_STATUS_CD == "FOREST") %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_FOREST = sum(ACRES), .groups = "drop"),
+                    estimates %>%
+                      filter(PREV_COND_STATUS_CD == "FOREST" & !is.na(PREV_FORTYPCD)) %>%
+                      group_by(STATECD_NWOS) %>%
+                      summarize(ACRES_FOREST_FT = sum(ACRES), .groups = "drop"),
+                    by = join_by(STATECD_NWOS)) %>%
+  mutate(PREV_COND_STATUS_CD = "FOREST", 
+         FT_ADJ = ACRES_FOREST / ACRES_FOREST_FT) %>%
+  select(STATECD_NWOS, PREV_COND_STATUS_CD, FT_ADJ)
+estimates.ft <- estimates %>%
+  filter(!(PREV_COND_STATUS_CD == "FOREST" & is.na(PREV_FORTYPCD))) %>%
+  left_join(ft.adj, 
+            by = join_by(STATECD_NWOS, PREV_COND_STATUS_CD)) %>%
+  mutate(ACRES = if_else(is.na(FT_ADJ), ACRES, ACRES * FT_ADJ)) %>%
+  select(-FT_ADJ)
+
+estimates.ft %>% filter(PREV_COND_STATUS_CD == "FOREST") %>% count(PREV_FORTYPCD)
+
+forest.loss.ft <- estimates.ft %>%
+  mutate(ACRES = ACRES / REMPER) %>%
+  left_join(ref.foresttype, by = join_by(PREV_FORTYPCD == FOREST_TYPE_CD)) %>%
+  filter(PREV_LU %in% c("FOREST"), !LU %in% c("FOREST")) %>%
+  group_by(FOREST_TYPE_GROUP) %>%
+  summarize(ACRES = sum(ACRES) / 1e6, .groups = "drop") %>%
+  mutate(PERC = (ACRES / sum(ACRES)) * 100,
+         FOREST_TYPE_GROUP = gsub(" group", "", FOREST_TYPE_GROUP),
+         FOREST_TYPE_GROUP = gsub(" / ", "/", FOREST_TYPE_GROUP)) %>%
+  arrange((ACRES))
+forest.loss.ft <- forest.loss.ft %>%
+  mutate(FOREST_TYPE_GROUP = factor(FOREST_TYPE_GROUP, levels = forest.loss.ft$FOREST_TYPE_GROUP))
+
+forest.loss.ft
+
+ggplot(forest.loss.ft %>% slice_max(PERC, n = 10)) + 
+  geom_bar(aes(x = FOREST_TYPE_GROUP,  y = PERC), stat = "identity", fill = "#a6611a") +
+  coord_flip() +
+  scale_y_continuous(expand = c(0, 0), lim = c(0, 25)) + 
+  labs(x = element_blank(), y = "Percent of Forest Lost") +
+  theme_linedraw() +
+  theme(panel.grid.major.y = element_blank(),
+        axis.ticks.y = element_blank())
+ggsave("../FIGURES/FOREST_TYPE_LOSS.pdf", width = 5, height = 3)
+ggsave("../FIGURES/FOREST_TYPE_LOSS.png", width = 5, height = 3)
+```
+
+## Forest Lost by Stand Origin
+```{r PREV_STDORGCD}
+estimates %>% filter(PREV_COND_STATUS_CD == "FOREST") %>% count(PREV_STDORGCD)
+
+estimates %>%
+  mutate(ACRES = ACRES / REMPER) %>%
+  filter(PREV_LU %in% c("FOREST"), !LU %in% c("FOREST")) %>%
+  group_by(PREV_STDORGCD) %>%
+  summarize(ACRES = sum(ACRES) / 1e6, .groups = "drop") %>%
+  arrange(desc(ACRES))  %>%
+  mutate(PERCENT = ACRES / sum(ACRES))
+```
+
+## Forest Lost by Site Productivity
+```{r PREV_SITECLCD}
+estimates %>% filter(PREV_COND_STATUS_CD == "FOREST") %>% count(PREV_SITECLCD)
+
+estimates %>%
+  mutate(ACRES = ACRES / REMPER) %>%
+  filter(PREV_LU %in% c("FOREST"), !LU %in% c("FOREST")) %>%
+  mutate(PREV_SITECLCD_GRP = case_match(PREV_SITECLCD,
+                                        c("1", "2", "3") ~ "HIGH",
+                                        c("4", "5", "6") ~ "MODERATE",
+                                        c("7") ~ "LOW")) %>%
+  group_by(PREV_SITECLCD_GRP) %>%
+  summarize(ACRES = sum(ACRES) / 1e6, .groups = "drop") %>%
+  mutate(PERCENT = round((ACRES / sum(ACRES)) * 100, 1))
+```
+
+## Forest Lost by Ownership Group
+```{r Ownership}
+estimates %>% filter(PREV_COND_STATUS_CD == "FOREST") %>% count(PREV_OWNCD)
+
+forest.loss.owncd <- estimates %>%
+  mutate(ACRES = ACRES / REMPER) %>%
+  filter(PREV_LU %in% c("FOREST"), !LU %in% c("FOREST")) %>%
+  group_by(PREV_OWNCD) %>%
+  summarize(ACRES = sum(ACRES) / 1e6, .groups = "drop") %>%
+  arrange(desc(ACRES)) %>%
+  mutate(PERCENT = (ACRES / sum(ACRES)) * 100) %>%
+  mutate(PREV_OWNCD = factor(PREV_OWNCD, levels = rev(c("FAMILY", "CORPORATE", "FEDERAL", "STATE", "LOCAL", "TRIBAL")), 
+                             labels = rev(c("Family", "Corporate", "Federal", "State", "Local", "Tribal"))))
+forest.loss.owncd
+ggplot(forest.loss.owncd %>% slice_max(PERCENT, n = 10)) + 
+  geom_bar(aes(x = PREV_OWNCD,  y = PERCENT), stat = "identity", fill = "#a6611a") +
+  coord_flip() +
+  scale_y_continuous(expand = c(0, 0), lim = c(0, 60)) +
+  labs(x = element_blank(), y = "Percent of Forest Lost") +
+  theme_linedraw() +
+  theme(panel.grid.major.y = element_blank(),
+        axis.ticks.y = element_blank())
+ggsave("../FIGURES/FOREST_OWN_LOSS.pdf", width = 5, height = 3)
+ggsave("../FIGURES/FOREST_OWN_LOSS.png", width = 5, height = 3)
+```
+
+# Literature Cited
+Burrill, E. A., A. M. DiTommaso, J. A. Turner, S. A. Pugh, G. Christensen, C. J. Perry, L. C. Lepine, D. M. Walker, and B. L. Conkling. 2024. The Forest Inventory and Analysis Database, FIADB user guides, volume database description (version 9.2), nationwide forest inventory (NFI). U.S. Department of Agriculture, Forest Service, Washington, DC. Available online at: https://research.fs.usda.gov/understory/forest-inventory-and-analysis-database-user-guide-nfi; last accessed September 4, 2024.
+
+Pugh, S. A., J. A. Turner, E. A. Burrill, and W. David. In review. The Forest Inventory and Analysis Database: Population estimation user guide (Edition: 2024). U.S. Department of Agriculture, Forest Service.
+
+# Appendices
+
+## Metadata
+Run date: `r Sys.Date()`
+
+EVALIDs: `r paste(evalgrps %>% pull(EVAL_GRP), collapse = ", ")`
+
+## Functions and Scripts
+*NEED TO UPDATE*
+```{r get_evalids.R}
+get_evalgrps
+```
+```{r get_evalids.sql}
+read.delim("SQL/get_evalgrps.sql", header=F)
+```
+
+```{r get_counties.R}
+get_counties
+```
+```{r get_forestarea.R}
+get_forestarea
+```
+
+```{r get_forestarea.sql}
+read.delim("SQL/get_forestarea.sql", header=F)
+
+```
